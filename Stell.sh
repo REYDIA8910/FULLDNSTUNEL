@@ -455,4 +455,616 @@ PROTOS=(
     "vaydns_socks|VayDNS + SOCKS5|vaydns|vs|vaydns.pub|vaydns|0"
     "dnstt_socks|DNSTT + SOCKS5|dnstt|ts|dnstt.pub|dnstt|0"
     "noizdns_socks|NoizDNS + SOCKS5 (Stealth)|sayedns|ts|dnstt.pub|dnstt|1"
-    "slipstream_socks|Slipstream + SOCKS5 (QUIC)|ss|
+    "slipstream_socks|Slipstream + SOCKS5 (QUIC)|ss|ss||slipstream|0"
+)
+PROTO=""
+
+proto_load() {    # $1=clave → PR_KEY PR_LABEL PR_TYPE PR_SUB PR_KEYF PR_SVC PR_STEALTH
+    local p
+    for p in "${PROTOS[@]}"; do
+        if [[ ${p%%|*} == "$1" ]]; then
+            IFS='|' read -r PR_KEY PR_LABEL PR_TYPE PR_SUB PR_KEYF PR_SVC PR_STEALTH <<< "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+proto_installed() {
+    local k=$1
+    proto_load "$k" || return 1
+    [[ $PR_SVC == "ssh" ]] && return 0
+    [[ -f "/etc/systemd/system/reydiatunnel-${PR_SVC}.service" ]]
+}
+
+proto_title() {
+    if [[ $PROTO == "all_ssh" ]]; then echo "COMBO TODOS LOS SSH"
+    elif [[ $PROTO == "all" ]]; then echo "PACK COMPLETO (TODOS)"
+    else proto_load "$PROTO" && echo "$PR_LABEL"; fi
+}
+
+choose_proto() {  # deja la elección en $PROTO
+    load_conf
+    local p i=0 k lbl sub svc st o
+    PROTO=""
+    echo "  ${Y}¿Qué protocolo quieres crear para tu App?${N}"
+    sline
+    echo "  ${C}── TÚNELES CON SSH (Soportan Límite de Conexiones, Fecha y HWID) ──${N}"
+    for p in "${PROTOS[@]}"; do
+        i=$((i+1))
+        IFS='|' read -r k lbl _ sub _ svc _ <<< "$p"
+        if [[ $i -eq 6 ]]; then
+            echo
+            echo "  ${C}── TÚNELES CON SOCKS5 (Proxy Directo) ──${N}"
+        fi
+        if proto_installed "$k"; then st="${G}ON${N}"; else st="${R}no instalado${N}"; fi
+        local dom_hint=""
+        [[ -n $sub && -n $DOMAIN ]] && dom_hint="(${sub}.${DOMAIN})"
+        printf "   ${R}[${W}%02d${R}]${N} ${C}◈${N} %-28s [%b] %s\n" "$i" "$lbl" "$st" "$dom_hint"
+    done
+    echo
+    echo "  ${C}── PAQUETES MÚLTIPLES ──${N}"
+    echo "   ${R}[${W}10${R}]${N} ${C}◈${N} ${G}COMBO SSH${N}      (Genera los 5 links SSH a la vez)"
+    echo "   ${R}[${W}11${R}]${N} ${C}◈${N} ${M}TODOS${N}          (Genera absolutamente todos los protocolos)"
+    echo "   ${R}[${W}00${R}]${N} ${C}◈${N} ${R}[ CANCELAR ]${N}"
+    sline
+    read -rp "  ${W}► Protocolo [1 = VayDNS + SSH]: ${N}" o; o=${o:-1}
+    case "$o" in
+        0|00) return 1 ;;
+        10) PROTO="all_ssh" ;;
+        11) PROTO="all" ;;
+        *)
+            if [[ $o =~ ^[0-9]+$ ]] && (( 10#$o >= 1 && 10#$o <= ${#PROTOS[@]} )); then
+                p=${PROTOS[$((10#$o-1))]}; k=${p%%|*}
+                if ! proto_installed "$k"; then
+                    warn "Ese motor no figura instalado (opción 13 para instalarlo)."
+                    read -rp "  ¿Generar el link de todas formas? [y/N]: " c
+                    [[ $c == y || $c == Y ]] || return 1
+                fi
+                PROTO=$k
+            else
+                fail "Opción inválida"; pause; return 1
+            fi
+            ;;
+    esac
+    echo
+}
+
+build_uri() {     # $1=proto_key $2=usuario $3=clave $4=exp_date(YYYY-MM-DD) $5=bound_hwid
+    load_conf
+    local k=$1 U=$2 P=${3:-$2} exp_str=$4 bound=${5:-} pub=""
+    proto_load "$k" || return 1
+    if [[ -n $PR_KEYF ]]; then
+        pub=$(cat "$KEY_DIR/$PR_KEYF" 2>/dev/null | tr -d '[:space:]')
+        [[ -z $pub ]] && return 1
+    fi
+
+    local dom="${DOMAIN}"
+    [[ -n $PR_SUB ]] && dom="${PR_SUB}.${DOMAIN}"
+    [[ $PR_TYPE == "ssh" ]] && dom="${DOMAIN:-$SERVER_IP}"
+
+    local ssh_flag="0" socks_u="" socks_p="" ssh_u="" ssh_p=""
+    if [[ $PR_TYPE == *_ssh || $PR_TYPE == "ssh" ]]; then
+        ssh_flag="1"; ssh_u="$U"; ssh_p="$P"
+    else
+        ssh_flag="0"; socks_u="$U"; socks_p="$P"
+    fi
+
+    local exp_ms=0 is_locked="0"
+    [[ -n $exp_str ]] && exp_ms=$(exp_millis "$exp_str" 2>/dev/null || echo 0)
+    [[ -n $bound ]] && is_locked="1"
+
+    local rtype="txt" cid="0"
+    if [[ $PR_TYPE == vaydns* ]]; then
+        rtype="${VAY_RTYPE:-caa}"
+        cid="2"
+    fi
+
+    local RAW="28|${PR_TYPE}|REY-${PR_LABEL%% *}-${U}|${dom}|${RESOLVER}|0|5000|bbr|1080|127.0.0.1|0|${pub}|${socks_u}|${socks_p}|${ssh_flag}|${ssh_u}|${ssh_p}|22|0|${SERVER_IP}|0||udp|password||||0|443|||${is_locked}||${exp_ms}|1|${bound}|0||${PR_STEALTH}|0|${SOCKS_PORT}|0|${rtype}|101|0|0|0|0|0|${cid}|0|||8080||0|/|1|||fanout|3||||||443|1|sni_split|100||0|0|0|8||0|"
+    echo "slipnet://$(echo -n "$RAW" | base64 -w 0)"
+}
+
+build_titomx_hwid_uri() { 
+    load_conf
+    local k=$1 cname=$2 exp_str=$3 pub=""
+    proto_load "$k" || return 1
+    [[ $PR_TYPE == *_ssh || $PR_TYPE == "ssh" ]] || return 1
+    if [[ -n $PR_KEYF ]]; then
+        pub=$(cat "$KEY_DIR/$PR_KEYF" 2>/dev/null | tr -d '[:space:]')
+        [[ -z $pub ]] && return 1
+    fi
+
+    local enum_name
+    case "$PR_TYPE" in
+        vaydns_ssh)     enum_name="VAYDNS_SSH" ;;
+        dnstt_ssh)      enum_name="DNSTT_SSH" ;;
+        sayedns_ssh)    enum_name="NOIZDNS_SSH" ;;
+        slipstream_ssh) enum_name="SLIPSTREAM_SSH" ;;
+        ssh)            enum_name="SSH" ;;
+        *) return 1 ;;
+    esac
+
+    local dom="${DOMAIN}"
+    [[ -n $PR_SUB ]] && dom="${PR_SUB}.${DOMAIN}"
+    [[ $PR_TYPE == "ssh" ]] && dom="${DOMAIN:-$SERVER_IP}"
+    local exp_ms=0
+    [[ -n $exp_str ]] && exp_ms=$(exp_millis "$exp_str" 2>/dev/null || echo 0)
+    local stealth_bool="false"
+    [[ $PR_STEALTH == "1" ]] && stealth_bool="true"
+
+    local json
+    json=$(cat <<JSON
+{"version":1,"profile":{"name":"REY-${PR_LABEL%% *}-${cname}","domain":"${dom}","resolvers":[{"host":"8.8.8.8","port":53,"authoritative":false}],"tunnelType":"${enum_name}","dnsttPublicKey":"${pub}","sshUsername":"hwid","sshPassword":"hwid","sshPort":22,"sshHost":"${SERVER_IP}","sshAuthType":"PASSWORD","hwidLogin":true,"expirationDate":${exp_ms},"noizdnsStealth":${stealth_bool},"vaydnsRecordType":"${VAY_RTYPE:-caa}","vaydnsClientIdSize":2}}
+JSON
+)
+    echo "reydiatunnel://$(echo -n "$json" | base64 -w 0 | tr '+/' '-_' | tr -d '=')"
+}
+
+build_titomx_manual_uri() { 
+    load_conf
+    local k=$1 U=$2 P=$3 exp_str=$4 cname=${5:-$2} pub=""
+    proto_load "$k" || return 1
+    if [[ -n $PR_KEYF ]]; then
+        pub=$(cat "$KEY_DIR/$PR_KEYF" 2>/dev/null | tr -d '[:space:]')
+        [[ -z $pub ]] && return 1
+    fi
+
+    local enum_name
+    case "$PR_TYPE" in
+        vaydns_ssh)     enum_name="VAYDNS_SSH" ;;
+        dnstt_ssh)      enum_name="DNSTT_SSH" ;;
+        sayedns_ssh)    enum_name="NOIZDNS_SSH" ;;
+        slipstream_ssh) enum_name="SLIPSTREAM_SSH" ;;
+        ssh)            enum_name="SSH" ;;
+        vaydns)         enum_name="VAYDNS" ;;
+        dnstt)          enum_name="DNSTT" ;;
+        sayedns)        enum_name="NOIZDNS" ;;
+        ss)             enum_name="SLIPSTREAM" ;;
+        *) return 1 ;;
+    esac
+
+    local dom="${DOMAIN}"
+    [[ -n $PR_SUB ]] && dom="${PR_SUB}.${DOMAIN}"
+    [[ $PR_TYPE == "ssh" ]] && dom="${DOMAIN:-$SERVER_IP}"
+
+    local exp_ms=0
+    [[ -n $exp_str ]] && exp_ms=$(exp_millis "$exp_str" 2>/dev/null || echo 0)
+    local stealth_bool="false"
+    [[ $PR_STEALTH == "1" ]] && stealth_bool="true"
+
+    local res_json="" r h pt au
+    IFS=',' read -ra _rs <<< "$RESOLVER"
+    for r in "${_rs[@]}"; do
+        IFS=':' read -r h pt au <<< "$r"
+        [[ -z $h ]] && continue
+        [[ -n $res_json ]] && res_json+=","
+        res_json+="{\"host\":\"${h}\",\"port\":${pt:-53},\"authoritative\":$([[ $au == 1 ]] && echo true || echo false)}"
+    done
+
+    local creds
+    if [[ $PR_TYPE == *_ssh || $PR_TYPE == "ssh" ]]; then
+        creds="\"sshUsername\":\"${U}\",\"sshPassword\":\"${P}\",\"sshPort\":22,\"sshHost\":\"${SERVER_IP}\",\"sshAuthType\":\"PASSWORD\""
+    else
+        creds="\"socksUsername\":\"${U}\",\"socksPassword\":\"${P}\""
+    fi
+
+    local json
+    json="{\"version\":1,\"profile\":{\"name\":\"REY-${PR_LABEL%% *}-${cname}\",\"domain\":\"${dom}\",\"resolvers\":[${res_json}],\"tunnelType\":\"${enum_name}\",\"dnsttPublicKey\":\"${pub}\",${creds},\"socks5ServerPort\":${SOCKS_PORT},\"isLocked\":false,\"hwidLogin\":false,\"expirationDate\":${exp_ms},\"noizdnsStealth\":${stealth_bool},\"vaydnsRecordType\":\"${VAY_RTYPE:-caa}\",\"vaydnsClientIdSize\":2,\"resolverMode\":\"FANOUT\",\"rrSpreadCount\":3}}"
+    echo "reydiatunnel://$(echo -n "$json" | base64 -w 0 | tr '+/' '-_' | tr -d '=')"
+}
+
+generate_uri() {  
+    load_conf
+    local u=$1 p=${2:-$1} which=${3:-vaydns} exp=$4 tipo=${5:-MANUAL} cname=${6:-$1}
+    local ks=() item k uri t_uri bound=""
+    [[ $tipo == "HWID" ]] && bound="$u"
+
+    if [[ $which == "all_ssh" ]]; then
+        for item in "${PROTOS[@]}"; do
+            k=${item%%|*}; proto_load "$k"
+            [[ $PR_TYPE == *_ssh || $PR_TYPE == "ssh" ]] && proto_installed "$k" && ks+=("$k")
+        done
+    elif [[ $which == "all" ]]; then
+        for item in "${PROTOS[@]}"; do k=${item%%|*}; proto_installed "$k" && ks+=("$k"); done
+    else
+        ks=("$which")
+    fi
+    [[ ${#ks[@]} -eq 0 ]] && { warn "No hay protocolos activos (opción 13)."; return; }
+
+    for k in "${ks[@]}"; do
+        proto_load "$k" || continue
+        if [[ $tipo == "MANUAL" ]]; then
+            t_uri=$(build_titomx_manual_uri "$k" "$u" "$p" "$exp" "$cname")
+            if [[ -z $t_uri ]]; then warn "$PR_LABEL: falta la llave pública ($KEY_DIR/$PR_KEYF). Usa opción 13."; continue; fi
+            echo "  ${Y}📋 Link reydiatunnel:// ($PR_LABEL):${N}"
+            echo "${G}${t_uri}${N}"
+            echo
+            continue
+        fi
+        uri=$(build_uri "$k" "$u" "$p" "$exp" "$bound")
+        if [[ -z $uri ]]; then warn "$PR_LABEL: falta la llave pública ($KEY_DIR/$PR_KEYF). Usa opción 13."; continue; fi
+        echo "  ${Y}📋 Link slipnet:// ($PR_LABEL):${N}"
+        echo "${G}${uri}${N}"
+        if [[ $tipo == "HWID" ]] && t_uri=$(build_titomx_hwid_uri "$k" "$cname" "$exp"); then
+            echo "  ${M}📋 Link reydiatunnel:// Autologin HWID ($PR_LABEL):${N}"
+            echo "${C}${t_uri}${N}"
+        fi
+        echo
+    done
+}
+
+bulk_links() {    
+    local p k
+    for p in "${PROTOS[@]}"; do
+        k=${p%%|*}; proto_load "$k"
+        if [[ $PROTO == "all_ssh" ]]; then
+            [[ $PR_TYPE == *_ssh || $PR_TYPE == "ssh" ]] || continue
+        elif [[ $PROTO != "all" && $PROTO != "$k" ]]; then
+            continue
+        fi
+        proto_installed "$k" || continue
+        echo "$1 | $2 | $3 | $4 | $PR_LABEL | $(build_titomx_manual_uri "$k" "$1" "$2" "$3" "$1")"
+    done
+}
+
+link_menu() {
+    clear; echo "${BGC}        🔗  GENERAR LINK        ${N}"; echo
+    read -rp "  Usuario o HWID: " h
+    local rec n e m s t p pr; rec=$(db_get "$h")
+    [[ -z $rec ]] && { fail "No registrado en FULLDNSTUNEL"; pause; return; }
+    IFS='|' read -r _ n e m s t p pr <<< "$rec"
+    t=${t:-HWID}
+    [[ $t == MANUAL ]] || p=""
+    echo
+    choose_proto || return
+    generate_uri "$h" "$p" "$PROTO" "$e" "$t" "$n"
+    pause
+}
+
+# ══════════════════════════ MOTORES / INSTALACIÓN ══════════════════════════
+fetch_engine() {  
+    local dest="$BIN_DIR/$1"
+    mkdir -p "$BIN_DIR"
+    if curl -fsSL --max-time 180 -o "$dest.tmp" "$REPO_BIN/$1-linux-$ARCH"; then
+        mv -f "$dest.tmp" "$dest"; chmod +x "$dest"; return 0
+    fi
+    rm -f "$dest.tmp"; return 1
+}
+
+fetch_all_engines() {
+    local e got=0
+    for e in dnstt-server vaydns-server slipstream-server; do
+        if fetch_engine "$e"; then ok "Motor $e descargado"; got=$((got+1))
+        elif [[ -x $BIN_DIR/$e ]]; then warn "$e: no se pudo bajar, uso la copia local"; got=$((got+1))
+        elif [[ -x /usr/local/bin/$e ]]; then cp -f "/usr/local/bin/$e" "$BIN_DIR/$e"; ok "$e copiado de /usr/local/bin"; got=$((got+1))
+        else warn "$e: no está en tu repo (se omite)"; fi
+    done
+    return $(( got == 0 ))
+}
+
+gen_keys() {
+    mkdir -p "$KEY_DIR"; chmod 700 "$KEY_DIR"
+    local old=/etc/slipgate/tunnels e f
+    if [[ -f $old/dnstt-ssh/server.key && ! -f $KEY_DIR/dnstt.key ]]; then
+        cp "$old/dnstt-ssh/server.key" "$KEY_DIR/dnstt.key"; ok "Llave DNSTT reutilizada"
+        for f in "$old"/dnstt-ssh/*.pub; do [[ -f $f ]] && cp "$f" "$KEY_DIR/dnstt.pub" && break; done
+    fi
+    if [[ -f $old/vaydns-ssh/server.key && ! -f $KEY_DIR/vaydns.key ]]; then
+        cp "$old/vaydns-ssh/server.key" "$KEY_DIR/vaydns.key"; ok "Llave VayDNS reutilizada"
+        for f in "$old"/vaydns-ssh/*.pub; do [[ -f $f ]] && cp "$f" "$KEY_DIR/vaydns.pub" && break; done
+    fi
+    if [[ -f $old/slipstream-ssh/cert.pem && ! -f $KEY_DIR/slip.crt ]]; then
+        cp "$old/slipstream-ssh/cert.pem" "$KEY_DIR/slip.crt"
+        cp "$old/slipstream-ssh/key.pem"  "$KEY_DIR/slip.key"; ok "Certificado Slipstream reutilizado"
+    fi
+    for e in dnstt vaydns; do
+        if [[ -x $BIN_DIR/$e-server && ! -f $KEY_DIR/$e.key ]]; then
+            "$BIN_DIR/$e-server" -gen-key -privkey-file "$KEY_DIR/$e.key" -pubkey-file "$KEY_DIR/$e.pub" >/dev/null 2>&1 \
+              && ok "Llaves $e generadas" || warn "No se pudo generar llave de $e (revisa: $BIN_DIR/$e-server -h)"
+        fi
+    done
+    if [[ -x $BIN_DIR/slipstream-server && ! -f $KEY_DIR/slip.crt ]]; then
+        openssl req -x509 -newkey rsa:2048 -nodes -keyout "$KEY_DIR/slip.key" -out "$KEY_DIR/slip.crt" \
+            -days 3650 -subj "/CN=$DOMAIN" >/dev/null 2>&1 && ok "Certificado Slipstream generado"
+    fi
+    if [[ -f $KEY_DIR/vaydns.key && ! -s $KEY_DIR/vaydns.pub ]]; then
+        warn "Falta la llave pública de VayDNS (64 caracteres hex)."
+        read -rp "  Pégala aquí: " pk
+        [[ $pk =~ ^[0-9a-fA-F]{64}$ ]] && echo "$pk" > "$KEY_DIR/vaydns.pub" || warn "Llave inválida; podrás ponerla en $KEY_DIR/vaydns.pub"
+    fi
+    if [[ -f $KEY_DIR/dnstt.key && ! -s $KEY_DIR/dnstt.pub ]]; then
+        warn "Falta la llave pública de DNSTT/NoizDNS (64 caracteres hex)."
+        read -rp "  Pégala aquí (Enter = omitir): " pk
+        [[ $pk =~ ^[0-9a-fA-F]{64}$ ]] && echo "$pk" > "$KEY_DIR/dnstt.pub" || warn "Sin llave pública DNSTT; podrás ponerla en $KEY_DIR/dnstt.pub"
+    fi
+}
+
+write_unit() {    # $1=nombre $2=desc $3=ExecStart
+    cat > "/etc/systemd/system/reydiatunnel-$1.service" <<EOF
+[Unit]
+Description=FULLDNSTUNEL $2
+After=network.target
+
+[Service]
+ExecStart=$3
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+write_router() {
+    mkdir -p "$OPT_DIR"
+    cat > "$OPT_DIR/dnsrouter.py" <<'PY'
+#!/usr/bin/env python3
+# FULLDNSTUNEL DNS Router: escucha UDP/53 y reparte por dominio a cada motor.
+import asyncio, json, signal
+
+CFG = "/etc/reydiatunnel/routes.json"
+routes = {}
+
+def load():
+    global routes
+    try:
+        with open(CFG) as f:
+            routes = json.load(f)
+    except Exception:
+        pass
+
+def qname(data):
+    i, labels = 12, []
+    try:
+        while True:
+            l = data[i]
+            if l == 0:
+                break
+            if l & 0xC0:
+                return None
+            labels.append(data[i + 1:i + 1 + l].decode("ascii", "ignore").lower())
+            i += 1 + l
+    except IndexError:
+        return None
+    return ".".join(labels)
+
+class Router(asyncio.DatagramProtocol):
+    def connection_made(self, t):
+        self.t = t
+
+    def datagram_received(self, data, addr):
+        name = qname(data)
+        if not name:
+            return
+        for dom, port in routes.items():
+            if name == dom or name.endswith("." + dom):
+                asyncio.ensure_future(self.fwd(data, addr, port))
+                return
+
+    async def fwd(self, data, addr, port):
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+
+        class C(asyncio.DatagramProtocol):
+            def datagram_received(s, d, a):
+                if not fut.done():
+                    fut.set_result(d)
+
+            def error_received(s, e):
+                if not fut.done():
+                    fut.set_exception(e)
+
+        tr, _ = await loop.create_datagram_endpoint(C, remote_addr=("127.0.0.1", port))
+        try:
+            tr.sendto(data)
+            resp = await asyncio.wait_for(fut, 5)
+            self.t.sendto(resp, addr)
+        except Exception:
+            pass
+        finally:
+            tr.close()
+
+async def main():
+    load()
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGHUP, load)
+    await loop.create_datagram_endpoint(Router, local_addr=("0.0.0.0", 53))
+    await asyncio.Event().wait()
+
+asyncio.run(main())
+PY
+    chmod +x "$OPT_DIR/dnsrouter.py"
+}
+
+apply_services() {
+    load_conf
+    [[ -z $DOMAIN ]] && { fail "Falta el dominio (opción 12)"; return 1; }
+    local svcs=() sep="" routes="{"
+    systemctl stop reydiatunnel-dnsrouter reydiatunnel-dnstt reydiatunnel-vaydns reydiatunnel-slipstream 2>/dev/null
+
+    if [[ -x $BIN_DIR/dnstt-server && -f $KEY_DIR/dnstt.key ]]; then
+        write_unit dnstt "DNSTT" "$BIN_DIR/dnstt-server -privkey-file $KEY_DIR/dnstt.key -mtu $MTU ts.$DOMAIN 127.0.0.1:$P_DNSTT 127.0.0.1:$TARGET_PORT"
+        routes+="${sep}\"ts.$DOMAIN\":$P_DNSTT,\"t.$DOMAIN\":$P_DNSTT"; sep=","; svcs+=(reydiatunnel-dnstt)
+    fi
+    if [[ -x $BIN_DIR/vaydns-server && -f $KEY_DIR/vaydns.key ]]; then
+        write_unit vaydns "VayDNS" "$BIN_DIR/vaydns-server -udp 127.0.0.1:$P_VAY -privkey-file $KEY_DIR/vaydns.key -mtu $MTU -domain vs.$DOMAIN -upstream 127.0.0.1:$TARGET_PORT -idle-timeout 10s -keepalive 2s -clientid-size 2 -record-type ${VAY_RTYPE:-caa}"
+        routes+="${sep}\"vs.$DOMAIN\":$P_VAY,\"v.$DOMAIN\":$P_VAY"; sep=","; svcs+=(reydiatunnel-vaydns)
+    fi
+    if [[ -x $BIN_DIR/slipstream-server && -f $KEY_DIR/slip.crt ]]; then
+        write_unit slipstream "Slipstream" "$BIN_DIR/slipstream-server --dns-listen-host 127.0.0.1 --dns-listen-port $P_SLIP --cert $KEY_DIR/slip.crt --key $KEY_DIR/slip.key --domain ss.$DOMAIN --target-address 127.0.0.1:$TARGET_PORT"
+        routes+="${sep}\"ss.$DOMAIN\":$P_SLIP,\"s.$DOMAIN\":$P_SLIP"; sep=","; svcs+=(reydiatunnel-slipstream)
+    fi
+    routes+="}"
+    if [[ ${#svcs[@]} -eq 0 ]]; then fail "No hay motores instalados (opción 13)"; return 1; fi
+
+    echo "$routes" > "$ROUTES"
+    write_router
+    write_unit dnsrouter "DNS Router" "/usr/bin/python3 $OPT_DIR/dnsrouter.py"
+    svcs+=(reydiatunnel-dnsrouter)
+
+    systemctl daemon-reload
+    local s
+    for s in "${svcs[@]}"; do
+        systemctl enable "$s" >/dev/null 2>&1
+        systemctl restart "$s"
+        sleep 1
+        if systemctl is-active --quiet "$s"; then ok "$s activo"
+        else fail "$s no arrancó → journalctl -u $s -n 20"; fi
+    done
+}
+
+free_port53() {
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        mkdir -p /etc/systemd/resolved.conf.d
+        printf "[Resolve]\nDNSStubListener=no\n" > /etc/systemd/resolved.conf.d/reydiatunnel.conf
+        ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+        systemctl restart systemd-resolved
+    fi
+    command -v ufw >/dev/null && ufw status | grep -q active && ufw allow 53/udp >/dev/null 2>&1
+    ok "Puerto 53/UDP liberado"
+}
+
+setup_ssh() {
+    mkdir -p /etc/ssh/sshd_config.d
+    grep -qiE '^Include.*sshd_config\.d' /etc/ssh/sshd_config || sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
+    cat > /etc/ssh/sshd_config.d/00-reydiatunnel.conf <<'EOF'
+PasswordAuthentication yes
+UsePAM yes
+AllowTcpForwarding yes
+EOF
+    grep -q pam_limits.so /etc/pam.d/sshd || echo "session required pam_limits.so" >> /etc/pam.d/sshd
+    if sshd -t 2>/dev/null; then
+        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
+        ok "SSH preparado (password + límite de sesiones PAM)"
+    else
+        warn "sshd -t reportó errores; revisa /etc/ssh/sshd_config"
+    fi
+}
+
+install_all() {
+    clear; echo "${BGC}        ⚡  INSTALANDO FULLDNSTUNEL DATA CENTER  ⚡        ${N}"; echo
+    load_conf
+    if [[ -z $DOMAIN ]]; then
+        read -rp "  Dominio base (ej. tudominio.com): " DOMAIN
+        [[ -z $DOMAIN ]] && { fail "Necesito el dominio"; return 1; }
+    fi
+    echo "  ${Y}[*] Instalando dependencias...${N}"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq >/dev/null 2>&1
+    apt-get install -y -qq curl openssl python3 cron procps iproute2 >/dev/null 2>&1
+    ok "Dependencias listas"
+
+    mkdir -p "$CONF_DIR" "$KEY_DIR" "$BIN_DIR"; touch "$DB"
+    SERVER_IP=$(get_ip); save_conf
+
+    echo "  ${Y}[*] Descargando motores desde TU repo...${N}"
+    if ! fetch_all_engines; then
+        fail "No pude bajar ningún motor. Revisa REPO_BIN al inicio del script."
+        return 1
+    fi
+    local u
+    for u in $(systemctl list-unit-files --no-legend 'slipgate-*' 2>/dev/null | awk '{print $1}'); do
+        systemctl disable --now "$u" >/dev/null 2>&1
+    done
+    free_port53
+    gen_keys
+    setup_ssh
+    apply_services
+    echo "*/15 * * * * root $SELF --cleanup >/dev/null 2>&1" > /etc/cron.d/reydiatunnel
+    echo
+    ok "Instalación terminada. Abre el panel con:  ${W}reydiatunnel${N}"
+    echo
+    echo "  ${Y}Registros DNS que debes tener en tu dominio:${N}"
+    echo "    ns.${DOMAIN}   A    ${SERVER_IP}"
+    echo "    vs.${DOMAIN}   NS   ns.${DOMAIN}"
+    echo "    ts.${DOMAIN}   NS   ns.${DOMAIN}"
+    echo "    ss.${DOMAIN}   NS   ns.${DOMAIN}"
+    echo
+    pause
+}
+
+restart_tunnels() {
+    local s
+    for s in dnstt vaydns slipstream dnsrouter; do
+        [[ -f /etc/systemd/system/reydiatunnel-$s.service ]] && systemctl restart "reydiatunnel-$s" 2>/dev/null
+    done
+    ok "Túneles reiniciados"; sleep 1
+}
+
+settings_menu() {
+    clear; echo "${BGC}        ⚙  AJUSTES        ${N}"; echo
+    load_conf
+    echo "  1) Dominio base : ${W}$DOMAIN${N}"
+    echo "  2) MTU          : ${W}$MTU${N}"
+    echo "  3) Puerto SSH destino (22 / 2222 de tu panel): ${W}$TARGET_PORT${N}"
+    echo "  4) Record Type de VayDNS (caa / txt / cname / ns): ${W}${VAY_RTYPE:-caa}${N}"
+    echo "  5) Resolver DNS en links: ${W}${RESOLVER:-8.8.8.8:53:0}${N}"
+    echo "  0) Volver"
+    read -rp "  Opción: " o
+    case $o in
+        1) read -rp "  Nuevo dominio: " v; [[ -n $v ]] && DOMAIN=$v ;;
+        2) read -rp "  Nuevo MTU: " v; [[ $v =~ ^[0-9]+$ ]] && MTU=$v ;;
+        3) read -rp "  Nuevo puerto: " v; [[ $v =~ ^[0-9]+$ ]] && TARGET_PORT=$v ;;
+        4) read -rp "  Record Type VayDNS (caa/txt/cname/ns): " v; [[ -n $v ]] && VAY_RTYPE=$v ;;
+        5) read -rp "  Resolver (ej. 8.8.8.8:53:0): " v; [[ -n $v ]] && RESOLVER=$v ;;
+        *) return ;;
+    esac
+    save_conf; apply_services; pause
+}
+
+engines_menu() {
+    clear; echo "${BGC}        🛠  MOTORES        ${N}"; echo
+    load_conf
+    fetch_all_engines
+    gen_keys
+    apply_services
+    pause
+}
+
+update_script() {
+    echo "  ${Y}[*] Descargando última versión desde GitHub...${N}"
+    if curl -fsSL -H "Cache-Control: no-cache" --max-time 30 "${REPO_SCRIPT}?t=$(date +%s)" -o /tmp/reydiatunnel.new && bash -n /tmp/reydiatunnel.new; then
+        install -m 755 /tmp/reydiatunnel.new "$SELF"
+        rm -f /tmp/reydiatunnel.new
+        ok "¡Script actualizado a la nueva versión! Recargando panel..."
+        sleep 1
+        exec "$SELF"
+    else
+        fail "No se pudo actualizar (revisa que reydiatunnel.sh esté subido en tu repo)"
+        pause
+    fi
+}
+
+# ══════════════════════════ ENTRADA ══════════════════════════
+if [[ $1 == "--cleanup" ]]; then load_conf; cleanup; exit 0; fi
+
+if [[ "$0" != "$SELF" ]]; then
+    if [[ -f "$0" && -r "$0" ]]; then install -m 755 "$0" "$SELF"
+    else curl -fsSL "${REPO_SCRIPT}?t=$(date +%s)" -o "$SELF" 2>/dev/null && chmod +x "$SELF"; fi
+fi
+
+load_conf
+[[ ! -f $CONF || -z $DOMAIN ]] && install_all
+
+while true; do
+    dashboard
+    read -rp " ${W}► Opción : ${N}" op
+    case $op in
+        1|01) add_client ;;
+        2|02) add_manual ;;
+        3|03) add_bulk ;;
+        4|04) list_clients ;;
+        5|05) edit_client ;;
+        6|06) renew_client ;;
+        7|07) toggle_client ;;
+        8|08) delete_client ;;
+        9|09) purge_expired ;;
+        10) link_menu ;;
+        11) restart_tunnels ;;
+        12) settings_menu ;;
+        13) engines_menu ;;
+        14) update_script ;;
+        0|00) clear; exit 0 ;;
+    esac
+done
